@@ -52,7 +52,6 @@ for raw in _GDRIVE_KEYS_RAW:
         try:
             GDRIVE_KEYS.append(json.loads(raw))
         except Exception:
-            # TOML에서 \n 이스케이프 이슈 대비
             try:
                 GDRIVE_KEYS.append(json.loads(str(raw)))
             except Exception:
@@ -121,17 +120,26 @@ def append_log(*args, **kwargs):
     # 로그 비활성화: 아무것도 하지 않음
     return
 
-# ===================== 키 로테이터 =====================
+# ===================== 키 로테이터 (범용화) =====================
 class RotatingKeys:
-    def __init__(self, keys: list[str], state_key: str, on_rotate=None):
-        keys = [k.strip() for k in (keys or []) if k and k.strip()]
-        self.keys = keys[:10]
+    def __init__(self, keys, state_key: str, on_rotate=None, treat_as_strings: bool = True):
+        cleaned = []
+        for k in (keys or []):
+            if k is None:
+                continue
+            if treat_as_strings and isinstance(k, str):
+                ks = k.strip()
+                if ks:
+                    cleaned.append(ks)
+            else:
+                cleaned.append(k)
+        self.keys = cleaned[:10]
         self.state_key = state_key
         self.on_rotate = on_rotate
         idx = st.session_state.get(state_key, 0)
         self.idx = 0 if not self.keys else (idx % len(self.keys))
         st.session_state[state_key] = self.idx
-    def current(self) -> str | None:
+    def current(self):
         if not self.keys: return None
         return self.keys[self.idx % len(self.keys)]
     def rotate(self):
@@ -171,7 +179,7 @@ def with_retry(fn, tries=2, backoff=1.4):
             time.sleep((i + 1) * backoff)
 
 class RotatingYouTube:
-    def __init__(self, keys: list[str], state_key="yt_key_idx", log=None):
+    def __init__(self, keys, state_key="yt_key_idx", log=None):
         self.rot = RotatingKeys(keys, state_key, on_rotate=lambda i, k: log and log(f"🔁 YouTube 키 전환 → #{i+1}"))
         self.log = log
         self.service = None
@@ -201,7 +209,7 @@ def is_gemini_quota_error(exc: Exception) -> bool:
     msg = (str(exc) or "").lower()
     return ("429" in msg) or ("too many requests" in msg) or ("rate limit" in msg) or ("resource exhausted" in msg) or ("quota" in msg)
 
-def call_gemini_rotating(model_name: str, keys: list[str], system_instruction: str, user_payload: str,
+def call_gemini_rotating(model_name: str, keys, system_instruction: str, user_payload: str,
                          timeout_s: int = GEMINI_TIMEOUT, max_tokens: int = GEMINI_MAX_TOKENS, on_rotate=None) -> str:
     rot = RotatingKeys(keys, state_key="gem_key_idx", on_rotate=lambda i, k: on_rotate and on_rotate(i, k))
     if not rot.current():
@@ -238,7 +246,12 @@ def _build_drive_service_from_creds_dict(creds_dict: dict):
 
 class RotatingDrive:
     def __init__(self, creds_dicts: list[dict], state_key="drive_key_idx", log=None):
-        self.rot = RotatingKeys(list(range(len(creds_dicts))), state_key, on_rotate=lambda i, _: log and log(f"🔁 Drive 키 전환 → #{i+1}"))
+        self.rot = RotatingKeys(
+            list(range(len(creds_dicts))),
+            state_key,
+            on_rotate=lambda i, _: log and log(f"🔁 Drive 키 전환 → #{i+1}"),
+            treat_as_strings=False,  # << 중요: 정수 인덱스를 문자열 취급하지 않음
+        )
         self.creds_dicts = creds_dicts or []
         if not self.creds_dicts:
             raise RuntimeError("Drive 서비스 계정 키가 비어 있습니다.")
@@ -550,7 +563,7 @@ def build_history_context(pairs: list[tuple[str, str]]) -> str:
     if not pairs: return ""
     lines = []
     for i, (q, a) in enumerate(pairs, 1):
-        lines.append(f"[이전 Q{i}]: {q}")
+        lines.append(f"[이전 Q{i}]: {q]")
         lines.append(f"[이전 A{i}]: {a}")
     return "\n".join(lines)
 
@@ -757,7 +770,7 @@ def save_current_session(name_prefix: str | None = None):
             }
             for fn in sorted(os.listdir(outdir)):
                 p = os.path.join(outdir, fn)
-                if not os.path.isfile(p): 
+                if not os.path.isfile(p):
                     continue
                 ext = os.path.splitext(fn)[1].lower()
                 mime = mimemap.get(ext, "application/octet-stream")
@@ -1481,14 +1494,12 @@ with tab_sessions:
             if not folders:
                 st.info("Drive에 저장된 세션이 없습니다.")
             else:
-                # 이름 오름차순 → 최신 정렬 원하면 정렬 기준 변경 가능
                 options = [f["name"] for f in folders]
                 idx_map = {f["name"]: f["id"] for f in folders}
                 selected_name = st.selectbox("세션 선택(Drive)", options, key="sess_select_drive")
                 selected_id = idx_map.get(selected_name)
                 if selected_id:
                     files = drive_list_files_in_folder(rd, selected_id)
-                    # manifest 우선 표시
                     manifest = next((x for x in files if x["name"] == "manifest.json"), None)
                     if manifest:
                         st.markdown(f"- **Drive 폴더 링크:** https://drive.google.com/drive/folders/{selected_id}")
