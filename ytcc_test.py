@@ -844,95 +844,80 @@ def save_current_session(name_prefix: str | None = None):
     st.session_state["last_drive_debug"] = _drive_config_diagnostics()
     st.session_state["last_drive_error"] = ""
 
-# Drive 업로드 (세션 폴더 생성 후 전체 업로드)
-drive_folder_id = None
-uploaded = []
-if GDRIVE_PARENT_FOLDER_ID and GDRIVE_KEYS:
-    try:
-        rd = RotatingDrive(GDRIVE_KEYS, log=lambda m: st.write(m))
-
-        # ★ 부모 폴더 메타 조회: 공유드라이브 컨텍스트/driveId 확인용
-        parent_meta = drive_get_file_meta(rd, GDRIVE_PARENT_FOLDER_ID)
-
-        # ★ 세션 폴더 생성 (supportsAllDrives 적용된 drive_create_folder 사용 전제)
-        drive_folder_id = drive_create_folder(rd, sess_name, GDRIVE_PARENT_FOLDER_ID)
-
-        # 업로드
-        mimemap = {
-            ".csv": "text/csv",
-            ".json": "application/json",
-            ".md": "text/markdown",
-            ".png": "image/png",
-            ".zip": "application/zip"
-        }
-        for fn in sorted(os.listdir(outdir)):
-            p = os.path.join(outdir, fn)
-            if not os.path.isfile(p):
-                continue
-            ext = os.path.splitext(fn)[1].lower()
-            mime = mimemap.get(ext, "application/octet-stream")
-            info = drive_upload_file(rd, drive_folder_id, p, mime)  # supportsAllDrives 적용된 버전이어야 함
-            uploaded.append(info)
-
-        # manifest.json 업로드 (추가: parent_drive_id 기록)
-        manifest = {
-            "session_name": sess_name,
-            "parent_folder_id": GDRIVE_PARENT_FOLDER_ID,
-            "parent_drive_id": parent_meta.get("driveId", None),  # 공유드라이브면 값이 들어옴
-            "drive_folder_id": drive_folder_id,
-            "uploaded": uploaded,
-            "created_kst": datetime.now(_kst_tz()).strftime("%Y-%m-%d %H:%M:%S")
-        }
-        man_local = os.path.join(outdir, "manifest.json")
-        with open(man_local, "w", encoding="utf-8") as f:
-            json.dump(manifest, f, ensure_ascii=False, indent=2)
-        drive_upload_file(rd, drive_folder_id, man_local, "application/json")
-
-    except HttpError as e:
-        # ❗ 임시 진단 로그(왜 드라이브 저장이 안 됐는지 화면에 바로 표시)
-        st.error("❗Drive 저장 실패 (HttpError)")
+    # =============== Drive 업로드 (세션 폴더 생성 후 전체 업로드) ===============
+    drive_folder_id = None
+    uploaded = []
+    if GDRIVE_PARENT_FOLDER_ID and GDRIVE_KEYS:
         try:
-            st.write("• 부모 폴더 메타:", parent_meta)
-        except:
-            st.write("• 부모 폴더 메타 조회 실패")
-        st.write("• reason:", getattr(e, "error_details", None) or "n/a")
-        st.write("• status:", getattr(getattr(e, "resp", None), "status", "n/a"))
-        try:
-            payload = json.loads(getattr(e, "content", b"{}").decode("utf-8", errors="ignore"))
-        except Exception:
-            payload = {}
-        st.write("• raw:", payload)
-        st.warning(
-            "💡 점검 체크리스트\n"
-            "1) 부모 폴더가 **공유 드라이브(Shared Drive)** 소속인지\n"
-            "2) 서비스계정들이 공유 드라이브에 **콘텐츠 관리자** 이상 권한으로 초대됐는지\n"
-            "3) 코드의 drive_* 함수가 **supportsAllDrives=True** / **includeItemsFromAllDrives=True**로 호출되는지\n"
-        )
-    except Exception as e:
-        st.error("❗Drive 저장 실패 (기타 예외)")
-        try:
-            st.write("• 부모 폴더 메타:", parent_meta)
-        except:
-            st.write("• 부모 폴더 메타 조회 실패")
-        st.write("• 예외 타입:", type(e).__name__)
-        st.write("• 예외 메시지:", str(e))
-        st.warning(
-            "💡 점검 체크리스트\n"
-            "1) 부모 폴더가 **공유 드라이브(Shared Drive)** 소속인지\n"
-            "2) 서비스계정들이 공유 드라이브에 **콘텐츠 관리자** 이상 권한으로 초대됐는지\n"
-            "3) 코드의 drive_* 함수가 **supportsAllDrives=True** / **includeItemsFromAllDrives=True**로 호출되는지\n"
-        )
+            rd = RotatingDrive(GDRIVE_KEYS, log=lambda m: st.write(m))
+
+            # ★ 부모 폴더 메타 조회
+            parent_meta = drive_get_file_meta(rd, GDRIVE_PARENT_FOLDER_ID)
+
+            # ★ 세션 폴더 생성
+            drive_folder_id = drive_create_folder(rd, sess_name, GDRIVE_PARENT_FOLDER_ID)
+
+            # 업로드
+            mimemap = {
+                ".csv": "text/csv",
+                ".json": "application/json",
+                ".md": "text/markdown",
+                ".png": "image/png",
+                ".zip": "application/zip"
+            }
+            for fn in sorted(os.listdir(outdir)):
+                p = os.path.join(outdir, fn)
+                if not os.path.isfile(p):
+                    continue
+                ext = os.path.splitext(fn)[1].lower()
+                mime = mimemap.get(ext, "application/octet-stream")
+                info = drive_upload_file(rd, drive_folder_id, p, mime)
+                uploaded.append(info)
+
+            # manifest.json 업로드
+            manifest = {
+                "session_name": sess_name,
+                "parent_folder_id": GDRIVE_PARENT_FOLDER_ID,
+                "parent_drive_id": parent_meta.get("driveId", None),
+                "drive_folder_id": drive_folder_id,
+                "uploaded": uploaded,
+                "created_kst": datetime.now(_kst_tz()).strftime("%Y-%m-%d %H:%M:%S")
+            }
+            man_local = os.path.join(outdir, "manifest.json")
+            with open(man_local, "w", encoding="utf-8") as f:
+                json.dump(manifest, f, ensure_ascii=False, indent=2)
+            drive_upload_file(rd, drive_folder_id, man_local, "application/json")
+
+        except HttpError as e:
+            st.error("❗Drive 저장 실패 (HttpError)")
+            try:
+                st.write("• 부모 폴더 메타:", parent_meta)
+            except:
+                st.write("• 부모 폴더 메타 조회 실패")
+            st.write("• status:", getattr(getattr(e, "resp", None), "status", "n/a"))
+            st.write("• 메시지:", str(e))
+            st.warning(
+                "💡 점검 체크리스트\n"
+                "1) 부모 폴더가 **공유 드라이브** 소속인지\n"
+                "2) 서비스계정들이 공유 드라이브에 **콘텐츠 관리자** 이상 권한으로 초대됐는지\n"
+                "3) drive_* 함수가 **supportsAllDrives=True** 옵션으로 호출되는지\n"
+            )
+        except Exception as e:
+            st.error("❗Drive 저장 실패 (기타 예외)")
+            st.write("• 예외 타입:", type(e).__name__)
+            st.write("• 예외 메시지:", str(e))
 
     else:
-        # 설정 자체가 비어있을 때도 사유를 남김
+        # 설정 자체가 비어있을 때 이유 저장
         reasons = []
         if not GDRIVE_PARENT_FOLDER_ID:
-            reasons.append("GDRIVE_PARENT_FOLDER_ID가 비어 있습니다.")
+            reasons.append("GDRIVE_PARENT_FOLDER_ID가 비어 있음")
         if not GDRIVE_KEYS:
-            reasons.append("GDRIVE_KEY_1~3 파싱된 키가 없습니다.")
+            reasons.append("GDRIVE_KEY_1~3 파싱 실패")
         st.session_state["last_drive_error"] = " / ".join(reasons)
 
     return sess_name, drive_folder_id
+
 
 def list_sessions_local():
     if not os.path.exists(SESS_DIR): return []
