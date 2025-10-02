@@ -1109,7 +1109,7 @@ with tab_simple:
 
     if st.button("💾 세션 저장하기", key="simple_save_session"):
         name, _ = save_current_session()
-        st.success(f"세션 저장 완료(GitHub): {name}")
+        st.success(f"세션 저장 완료: {name}")
 
 # ===================== 2) 고급 모드 =====================
 with tab_advanced:
@@ -1364,7 +1364,7 @@ with tab_advanced:
 
                 if st.button("💾 세션 저장하기", key="adv_save_session_analysis"):
                     name, _ = save_current_session()
-                    st.success(f"세션 저장 완료(GitHub): {name}")
+                    st.success(f"세션 저장 완료: {name}")
 
     render_quant_viz(st.session_state.get("df_comments"), st.session_state.get("df_stats"), scope_label="(KST 기준)")
     render_downloads(st.session_state.get("df_comments"), st.session_state.get("df_analysis"),
@@ -1372,11 +1372,11 @@ with tab_advanced:
 
     if st.button("💾 세션 저장하기", key="adv_save_session_comments"):
         name, _ = save_current_session()
-        st.success(f"세션 저장 완료(GitHub): {name}")
+        st.success(f"세션 저장 완료: {name}")
 
 # ===================== 3) 세션 아카이브 (GitHub) =====================
 with tab_sessions:
-    st.subheader("저장된 세션 아카이브 (GitHub)")
+    st.subheader("저장된 세션 아카이브 ")
 
     if not (GITHUB_TOKEN and GITHUB_REPO):
         st.warning("⚠️ GitHub 설정이 비어 있습니다. st.secrets에 GITHUB_TOKEN / GITHUB_REPO / GITHUB_BRANCH를 넣어주세요.")
