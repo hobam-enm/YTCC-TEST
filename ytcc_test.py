@@ -2,7 +2,7 @@
 
 import streamlit as st
 import pandas as pd
-import io, os, json, re, time, shutil
+import io, os, json, re, time, shutil, traceback
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, parse_qs
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -43,7 +43,7 @@ GEMINI_MODEL = "gemini-2.0-flash-lite"
 GEMINI_TIMEOUT = 120
 GEMINI_MAX_TOKENS = 2048
 
-# =============== Google Drive 설정 (안전 파싱 버전) ===============
+# =============== Google Drive 설정 (안전 파싱 + 진단 로그) ===============
 GDRIVE_PARENT_FOLDER_ID = (st.secrets.get("GDRIVE_PARENT_FOLDER_ID") or "").strip()
 
 def _load_gdrive_keys():
@@ -52,30 +52,52 @@ def _load_gdrive_keys():
         raw = st.secrets.get(key_name)
         if not raw:
             continue
-        # dict로 들어온 경우
         if isinstance(raw, dict):
             keys.append(raw)
             continue
-        # 문자열로 들어온 경우
         if isinstance(raw, str):
             s = raw.strip()
-            # JSON 직파싱 시도
+            # 1차: 그대로 JSON
             try:
                 keys.append(json.loads(s))
                 continue
             except Exception:
                 pass
-            # \n 이스케이프 복원 후 재시도
+            # 2차: \n 복원 후 JSON
             try:
                 s2 = s.replace("\\n", "\n")
                 keys.append(json.loads(s2))
                 continue
             except Exception:
                 pass
-        # 그 외 타입은 스킵
     return keys
 
 GDRIVE_KEYS = _load_gdrive_keys()
+
+def _service_account_emails(creds_list):
+    emails = []
+    for c in creds_list or []:
+        em = c.get("client_email") if isinstance(c, dict) else None
+        if em:
+            emails.append(em)
+    return emails
+
+def _drive_config_diagnostics():
+    msgs = []
+    ok_id = bool(GDRIVE_PARENT_FOLDER_ID)
+    ok_keys = bool(GDRIVE_KEYS)
+    msgs.append(f"親폴더ID 설정: {'OK' if ok_id else '미설정(빈 값)'}")
+    msgs.append(f"서비스계정 키 로드: {len(GDRIVE_KEYS)}개")
+    if GDRIVE_KEYS:
+        emails = _service_account_emails(GDRIVE_KEYS)
+        if emails:
+            msgs.append("서비스계정 이메일:")
+            for em in emails:
+                msgs.append(f"  - {em}")
+            msgs.append("※ 위 이메일들이 Drive 폴더에 '편집자' 권한이 있는지 확인하세요.")
+    else:
+        msgs.append("※ GDRIVE_KEY_1~3가 TOML에 없거나 파싱 실패했습니다.")
+    return msgs
 
 # 수집 상한(필요시 조정)
 MAX_TOTAL_COMMENTS = 200_000
@@ -137,7 +159,6 @@ korean_stopwords = stopwords.stopwords("ko")
 
 # ===================== (로그 제거) append_log → no-op =====================
 def append_log(*args, **kwargs):
-    # 로그 비활성화: 아무것도 하지 않음
     return
 
 # ===================== 키 로테이터 (범용화) =====================
@@ -270,7 +291,7 @@ class RotatingDrive:
             list(range(len(creds_dicts))),
             state_key,
             on_rotate=lambda i, _: log and log(f"🔁 Drive 키 전환 → #{i+1}"),
-            treat_as_strings=False,  # << 중요: 정수 인덱스를 문자열 취급하지 않음
+            treat_as_strings=False,  # 정수 인덱스 유지
         )
         self.creds_dicts = creds_dicts or []
         if not self.creds_dicts:
@@ -570,6 +591,9 @@ def ensure_state():
         df_comments=None, df_analysis=None,
         adv_serialized_sample="", adv_result_text="",
         adv_followups=[], adv_history=[],
+        # 드라이브 진단 로그 (임시)
+        last_drive_debug=[],
+        last_drive_error="",
         # 입력값
         simple_follow_q="", adv_follow_q="",
     )
@@ -584,10 +608,9 @@ def build_history_context(pairs: list[tuple[str, str]]) -> str:
         return ""
     lines = []
     for i, (q, a) in enumerate(pairs, 1):
-        lines.append(f"[이전 Q{i}]: {q}")   # ← 여기 닫는 괄호를 } 로
-        lines.append(f"[이전 A{i}]: {a}")   # ← 이 줄도 동일 패턴
+        lines.append(f"[이전 Q{i}]: {q}")
+        lines.append(f"[이전 A{i}]: {a}")
     return "\n".join(lines)
-
 
 # ===================== 시각화 도구(저장용) =====================
 def _fig_keyword_bubble(df_comments) -> go.Figure | None:
@@ -715,7 +738,6 @@ def _build_session_name() -> str:
     return f"{_slugify_filename(kw)}_{now_kst}_{preset}"
 
 def _write_ai_texts(outdir: str):
-    # ai_simple.md / ai_advanced.md
     simple_txt = st.session_state.get("s_result_text", "")
     adv_txt = st.session_state.get("adv_result_text", "")
     if simple_txt:
@@ -726,13 +748,11 @@ def _write_ai_texts(outdir: str):
             f.write(adv_txt)
 
 def _write_viz_pngs(outdir: str):
-    # 현재 세션 데이터에서 그림 재생성 → PNG 저장
     df_comments_s = st.session_state.get("s_df_comments")
     df_stats_s = st.session_state.get("s_df_stats")
     df_comments_a = st.session_state.get("df_comments")
     df_stats_a = st.session_state.get("df_stats")
 
-    # 심플 기준(있으면 우선)
     dfc = df_comments_s if (df_comments_s is not None and not df_comments_s.empty) else st.session_state.get("df_comments")
     dfs = df_stats_s if (df_stats_s is not None and not df_stats_s.empty) else st.session_state.get("df_stats")
 
@@ -775,13 +795,20 @@ def save_current_session(name_prefix: str | None = None):
     _write_ai_texts(outdir)
     _write_viz_pngs(outdir)
 
+    # 드라이브 진단 초기화
+    st.session_state["last_drive_debug"] = _drive_config_diagnostics()
+    st.session_state["last_drive_error"] = ""
+
     # Drive 업로드 (세션 폴더 생성 후 전체 업로드)
     drive_folder_id = None
     uploaded = []
     if GDRIVE_PARENT_FOLDER_ID and GDRIVE_KEYS:
         try:
+            st.info("🔧 Drive 업로드 시작: 세션 폴더 생성 시도 중…")
             rd = RotatingDrive(GDRIVE_KEYS, log=lambda m: st.write(m))
             drive_folder_id = drive_create_folder(rd, sess_name, GDRIVE_PARENT_FOLDER_ID)
+            st.success(f"📁 Drive 세션 폴더 생성 완료: {drive_folder_id}")
+
             # 업로드
             mimemap = {
                 ".csv": "text/csv",
@@ -797,7 +824,9 @@ def save_current_session(name_prefix: str | None = None):
                 ext = os.path.splitext(fn)[1].lower()
                 mime = mimemap.get(ext, "application/octet-stream")
                 info = drive_upload_file(rd, drive_folder_id, p, mime)
+                st.write(f"⬆️ 업로드 완료: {fn} → {info.get('id')}")
                 uploaded.append(info)
+
             # manifest.json 업로드
             manifest = {
                 "session_name": sess_name,
@@ -810,8 +839,21 @@ def save_current_session(name_prefix: str | None = None):
             with open(man_local, "w", encoding="utf-8") as f:
                 json.dump(manifest, f, ensure_ascii=False, indent=2)
             drive_upload_file(rd, drive_folder_id, man_local, "application/json")
+            st.success("🗂️ manifest.json 업로드 완료")
         except Exception as e:
-            st.warning(f"Drive 업로드 중 문제 발생: {e}")
+            err_msg = f"{type(e).__name__}: {e}"
+            st.session_state["last_drive_error"] = err_msg
+            # 안전한 범위 내에서 간단 스택
+            st.warning("Drive 업로드 중 문제 발생 (자세한 진단 아래 표시)")
+            st.code(err_msg + "\n" + "\n".join(traceback.format_exc().splitlines()[-5:]), language="text")
+    else:
+        # 설정 자체가 비어있을 때도 사유를 남김
+        reasons = []
+        if not GDRIVE_PARENT_FOLDER_ID:
+            reasons.append("GDRIVE_PARENT_FOLDER_ID가 비어 있습니다.")
+        if not GDRIVE_KEYS:
+            reasons.append("GDRIVE_KEY_1~3 파싱된 키가 없습니다.")
+        st.session_state["last_drive_error"] = " / ".join(reasons)
 
     return sess_name, drive_folder_id
 
@@ -1202,6 +1244,12 @@ with tab_simple:
             st.success(f"세션 저장 완료 · Drive 폴더: https://drive.google.com/drive/folders/{drive_id}")
         else:
             st.success(f"세션 저장 완료(로컬) · {name}")
+            with st.expander("❗Drive 저장이 안 된 이유(임시 진단 로그)", expanded=True):
+                for line in st.session_state.get("last_drive_debug", []):
+                    st.write("• " + line)
+                err = st.session_state.get("last_drive_error", "")
+                if err:
+                    st.error("에러: " + err)
 
 # ===================== 2) 고급 모드 =====================
 with tab_advanced:
@@ -1460,6 +1508,12 @@ with tab_advanced:
                         st.success(f"세션 저장 완료 · Drive 폴더: https://drive.google.com/drive/folders/{drive_id}")
                     else:
                         st.success(f"세션 저장 완료(로컬) · {name}")
+                        with st.expander("❗Drive 저장이 안 된 이유(임시 진단 로그)", expanded=True):
+                            for line in st.session_state.get("last_drive_debug", []):
+                                st.write("• " + line)
+                            err = st.session_state.get("last_drive_error", "")
+                            if err:
+                                st.error("에러: " + err)
 
     render_quant_viz(st.session_state.get("df_comments"), st.session_state.get("df_stats"), scope_label="(KST 기준)")
     render_downloads(st.session_state.get("df_comments"), st.session_state.get("df_analysis"),
@@ -1471,6 +1525,12 @@ with tab_advanced:
             st.success(f"세션 저장 완료 · Drive 폴더: https://drive.google.com/drive/folders/{drive_id}")
         else:
             st.success(f"세션 저장 완료(로컬) · {name}")
+            with st.expander("❗Drive 저장이 안 된 이유(임시 진단 로그)", expanded=True):
+                for line in st.session_state.get("last_drive_debug", []):
+                    st.write("• " + line)
+                err = st.session_state.get("last_drive_error", "")
+                if err:
+                    st.error("에러: " + err)
 
 # ===================== 3) 세션 아카이브 =====================
 with tab_sessions:
@@ -1479,6 +1539,9 @@ with tab_sessions:
     drive_ok = bool(GDRIVE_PARENT_FOLDER_ID and GDRIVE_KEYS)
     if not drive_ok:
         st.info("Drive 설정이 없어 로컬 세션만 표시됩니다.")
+        with st.expander("❗Drive 사용 불가 사유(임시 진단 로그)", expanded=False):
+            for line in _drive_config_diagnostics():
+                st.write("• " + line)
         sess_list = list_sessions_local()
         if not sess_list:
             st.info("저장된 세션이 없습니다.")
@@ -1544,6 +1607,8 @@ with tab_sessions:
                     st.caption("※ Drive 링크는 접근 권한이 있는 사용자만 열 수 있습니다.")
         except Exception as e:
             st.warning(f"Drive 아카이브 로드 실패: {e}")
+            with st.expander("진단(스택 하이라이트)", expanded=False):
+                st.code(f"{type(e).__name__}: {e}\n" + "\n".join(traceback.format_exc().splitlines()[-8:]), language="text")
 
 # ===================== 초기화 버튼 =====================
 st.markdown("---")
