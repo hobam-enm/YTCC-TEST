@@ -1420,6 +1420,5 @@ with tab_sessions:
 # ===================== 초기화 버튼 =====================
 st.markdown("---")
 if st.button("🔄 초기화 하기", type="secondary"):
-    for k in list(st.session_state.keys()):
-        del st.session_state[k]
+    st.session_state.clear()
     st.rerun()
