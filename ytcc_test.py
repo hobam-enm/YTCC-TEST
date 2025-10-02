@@ -43,19 +43,39 @@ GEMINI_MODEL = "gemini-2.0-flash-lite"
 GEMINI_TIMEOUT = 120
 GEMINI_MAX_TOKENS = 2048
 
-# Google Drive 설정
-GDRIVE_PARENT_FOLDER_ID = st.secrets.get("GDRIVE_PARENT_FOLDER_ID", "")
-_GDRIVE_KEYS_RAW = [st.secrets.get("GDRIVE_KEY_1"), st.secrets.get("GDRIVE_KEY_2"), st.secrets.get("GDRIVE_KEY_3")]
-GDRIVE_KEYS = []
-for raw in _GDRIVE_KEYS_RAW:
-    if raw:
-        try:
-            GDRIVE_KEYS.append(json.loads(raw))
-        except Exception:
+# =============== Google Drive 설정 (안전 파싱 버전) ===============
+GDRIVE_PARENT_FOLDER_ID = (st.secrets.get("GDRIVE_PARENT_FOLDER_ID") or "").strip()
+
+def _load_gdrive_keys():
+    keys = []
+    for key_name in ("GDRIVE_KEY_1", "GDRIVE_KEY_2", "GDRIVE_KEY_3"):
+        raw = st.secrets.get(key_name)
+        if not raw:
+            continue
+        # dict로 들어온 경우
+        if isinstance(raw, dict):
+            keys.append(raw)
+            continue
+        # 문자열로 들어온 경우
+        if isinstance(raw, str):
+            s = raw.strip()
+            # JSON 직파싱 시도
             try:
-                GDRIVE_KEYS.append(json.loads(str(raw)))
+                keys.append(json.loads(s))
+                continue
             except Exception:
                 pass
+            # \n 이스케이프 복원 후 재시도
+            try:
+                s2 = s.replace("\\n", "\n")
+                keys.append(json.loads(s2))
+                continue
+            except Exception:
+                pass
+        # 그 외 타입은 스킵
+    return keys
+
+GDRIVE_KEYS = _load_gdrive_keys()
 
 # 수집 상한(필요시 조정)
 MAX_TOTAL_COMMENTS = 200_000
