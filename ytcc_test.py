@@ -1,5 +1,4 @@
 # 📊 유튜브 반응 리포트: AI 댓글요약 (Streamlit Cloud용 / 동시실행 1 슬롯 락 포함)
-
 import streamlit as st
 import pandas as pd
 import io, os, json, re, time, shutil, traceback
@@ -7,10 +6,9 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, parse_qs
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# YouTube API만 사용 (Drive 관련 임포트 제거)
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from googleapiclient.http import MediaFileUpload
-from google.oauth2 import service_account
 
 import google.generativeai as genai
 
@@ -33,7 +31,6 @@ SESS_DIR = os.path.join(BASE_DIR, "sessions")
 os.makedirs(SESS_DIR, exist_ok=True)
 
 # ===================== 비밀키 / 파라미터 =====================
-# secrets 우선, 없으면 하드코딩 백업
 _YT_FALLBACK = []
 _GEM_FALLBACK = []
 
@@ -43,62 +40,6 @@ GEMINI_MODEL = "gemini-2.0-flash-lite"
 GEMINI_TIMEOUT = 120
 GEMINI_MAX_TOKENS = 2048
 
-# =============== Google Drive 설정 (안전 파싱 + 진단 로그) ===============
-GDRIVE_PARENT_FOLDER_ID = (st.secrets.get("GDRIVE_PARENT_FOLDER_ID") or "").strip()
-
-def _load_gdrive_keys():
-    keys = []
-    for key_name in ("GDRIVE_KEY_1", "GDRIVE_KEY_2", "GDRIVE_KEY_3"):
-        raw = st.secrets.get(key_name)
-        if not raw:
-            continue
-        if isinstance(raw, dict):
-            keys.append(raw)
-            continue
-        if isinstance(raw, str):
-            s = raw.strip()
-            # 1차: 그대로 JSON
-            try:
-                keys.append(json.loads(s))
-                continue
-            except Exception:
-                pass
-            # 2차: \n 복원 후 JSON
-            try:
-                s2 = s.replace("\\n", "\n")
-                keys.append(json.loads(s2))
-                continue
-            except Exception:
-                pass
-    return keys
-
-GDRIVE_KEYS = _load_gdrive_keys()
-
-def _service_account_emails(creds_list):
-    emails = []
-    for c in creds_list or []:
-        em = c.get("client_email") if isinstance(c, dict) else None
-        if em:
-            emails.append(em)
-    return emails
-
-def _drive_config_diagnostics():
-    msgs = []
-    ok_id = bool(GDRIVE_PARENT_FOLDER_ID)
-    ok_keys = bool(GDRIVE_KEYS)
-    msgs.append(f"親폴더ID 설정: {'OK' if ok_id else '미설정(빈 값)'}")
-    msgs.append(f"서비스계정 키 로드: {len(GDRIVE_KEYS)}개")
-    if GDRIVE_KEYS:
-        emails = _service_account_emails(GDRIVE_KEYS)
-        if emails:
-            msgs.append("서비스계정 이메일:")
-            for em in emails:
-                msgs.append(f"  - {em}")
-            msgs.append("※ 위 이메일들이 Drive 폴더에 '편집자' 권한이 있는지 확인하세요.")
-    else:
-        msgs.append("※ GDRIVE_KEY_1~3가 TOML에 없거나 파싱 실패했습니다.")
-    return msgs
-
 # 수집 상한(필요시 조정)
 MAX_TOTAL_COMMENTS = 200_000
 MAX_COMMENTS_PER_VIDEO = 5_000
@@ -107,7 +48,6 @@ MAX_COMMENTS_PER_VIDEO = 5_000
 LOCK_PATH = os.path.join(BASE_DIR, "ytccai.busy.lock")
 
 def try_acquire_lock(ttl=7200):
-    # 오래된 락 정리
     if os.path.exists(LOCK_PATH):
         try:
             if time.time() - os.path.getmtime(LOCK_PATH) > ttl:
@@ -131,22 +71,10 @@ def release_lock():
         pass
 
 def lock_guard_start_or_warn():
-    """긴 작업 시작 전에 호출: 락을 잡고 True 반환, 실패시 경고 후 False"""
     if not try_acquire_lock():
         st.warning("다른 사용자가 작업 중입니다. 잠시 후 다시 시도하세요.")
         return False
     return True
-
-def drive_get_file_meta(rd, file_id: str) -> dict:
-    def _get(svc):
-        return svc.files().get(
-            fileId=file_id,
-            fields="id, name, parents, driveId, mimeType",
-            supportsAllDrives=True,           # ★ 공유드라이브도 조회 가능
-            includeItemsFromAllDrives=True,   # ★
-        ).execute()
-    return rd.execute(_get)
-
 
 # ===================== 기본 UI =====================
 st.set_page_config(page_title="📊 유튜브 반응 리포트: AI 댓글요약", layout="wide", initial_sidebar_state="collapsed")
@@ -289,119 +217,6 @@ def call_gemini_rotating(model_name: str, keys, system_instruction: str, user_pa
             if is_gemini_quota_error(e) and len(rot.keys) > 1:
                 rot.rotate(); attempts += 1; continue
             raise
-
-# ===================== Google Drive (서비스계정 로테이션) =====================
-_GOOGLE_SCOPES = ["https://www.googleapis.com/auth/drive"]
-def _build_drive_service_from_creds_dict(creds_dict: dict):
-    creds = service_account.Credentials.from_service_account_info(creds_dict, scopes=_GOOGLE_SCOPES)
-    return build("drive", "v3", credentials=creds, cache_discovery=False)
-
-class RotatingDrive:
-    def __init__(self, creds_dicts: list[dict], state_key="drive_key_idx", log=None):
-        self.rot = RotatingKeys(
-            list(range(len(creds_dicts))),
-            state_key,
-            on_rotate=lambda i, _: log and log(f"🔁 Drive 키 전환 → #{i+1}"),
-            treat_as_strings=False,  # 정수 인덱스 유지
-        )
-        self.creds_dicts = creds_dicts or []
-        if not self.creds_dicts:
-            raise RuntimeError("Drive 서비스 계정 키가 비어 있습니다.")
-        self.service = None
-        self._build()
-        self.log = log
-    def _build(self):
-        self.service = _build_drive_service_from_creds_dict(self.creds_dicts[self.rot.idx])
-    def _rotate_and_rebuild(self):
-        self.rot.rotate()
-        self._build()
-    def execute(self, fn, tries_per_key=2):
-        attempts = 0
-        max_attempts = len(self.creds_dicts) if self.creds_dicts else 1
-        while attempts < max_attempts:
-            try:
-                return with_retry(lambda: fn(self.service), tries=tries_per_key, backoff=1.6)
-            except Exception:
-                if attempts < max_attempts - 1:
-                    self._rotate_and_rebuild()
-                    attempts += 1
-                    continue
-                raise
-
-def drive_create_folder(rd: "RotatingDrive", name: str, parent_id: str) -> str:
-    def _create(svc):
-        meta = {
-            "name": name,
-            "mimeType": "application/vnd.google-apps.folder",
-            "parents": [parent_id],
-        }
-        return svc.files().create(
-            body=meta,
-            fields="id",
-            supportsAllDrives=True,            # ★ 중요
-        ).execute()["id"]
-    return rd.execute(_create)
-
-
-def drive_upload_file(rd: "RotatingDrive", folder_id: str, local_path: str, mime_type: str | None = None) -> dict:
-    filename = os.path.basename(local_path)
-    def _upload(svc):
-        meta = {"name": filename, "parents": [folder_id]}
-        media = MediaFileUpload(local_path, mimetype=mime_type, resumable=False)
-        return svc.files().create(
-            body=meta,
-            media_body=media,
-            fields="id, name, mimeType, webViewLink, webContentLink, size, createdTime",
-            supportsAllDrives=True,            # ★ 중요
-        ).execute()
-    return rd.execute(_upload)
-
-
-def drive_list_folders(rd: "RotatingDrive", parent_id: str) -> list[dict]:
-    items, page_token = [], None
-    query = f"'{parent_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
-
-    def _list(svc, token):
-        return svc.files().list(
-            q=query,
-            fields="nextPageToken, files(id, name, createdTime)",
-            pageToken=token,
-            orderBy="name",
-            supportsAllDrives=True,            # ★
-            includeItemsFromAllDrives=True,    # ★
-        ).execute()
-
-    while True:
-        resp = rd.execute(lambda svc: _list(svc, page_token))
-        items.extend(resp.get("files", []))
-        page_token = resp.get("nextPageToken")
-        if not page_token:
-            break
-    return items
-
-
-def drive_list_files_in_folder(rd: "RotatingDrive", folder_id: str) -> list[dict]:
-    items, page_token = [], None
-    query = f"'{folder_id}' in parents and trashed=false"
-
-    def _list(svc, token):
-        return svc.files().list(
-            q=query,
-            fields="nextPageToken, files(id, name, mimeType, size, webViewLink, webContentLink, createdTime)",
-            pageToken=token,
-            orderBy="name",
-            supportsAllDrives=True,             # ★
-            includeItemsFromAllDrives=True,     # ★
-        ).execute()
-
-    while True:
-        resp = rd.execute(lambda svc: _list(svc, page_token))
-        items.extend(resp.get("files", []))
-        page_token = resp.get("nextPageToken")
-        if not page_token:
-            break
-    return items
-
 
 # ===================== 유틸: ID/URL =====================
 def extract_video_id_one(s: str):
@@ -636,9 +451,6 @@ def ensure_state():
         df_comments=None, df_analysis=None,
         adv_serialized_sample="", adv_result_text="",
         adv_followups=[], adv_history=[],
-        # 드라이브 진단 로그 (임시)
-        last_drive_debug=[],
-        last_drive_error="",
         # 입력값
         simple_follow_q="", adv_follow_q="",
     )
@@ -657,7 +469,7 @@ def build_history_context(pairs: list[tuple[str, str]]) -> str:
         lines.append(f"[이전 A{i}]: {a}")
     return "\n".join(lines)
 
-# ===================== 시각화 도구(저장용) =====================
+# ===================== 시각화 도구(화면표시용) =====================
 def _fig_keyword_bubble(df_comments) -> go.Figure | None:
     try:
         custom_stopwords = {
@@ -753,16 +565,7 @@ def _fig_top_authors(df_comments):
     fig_auth = px.bar(top_authors, x="count", y="author", orientation="h", text="count", title="Top10 댓글 작성자 활동량")
     return fig_auth
 
-def _save_fig_png(fig: go.Figure, path: str):
-    if fig is None:
-        return False
-    try:
-        fig.write_image(path, format="png", scale=2)
-        return True
-    except Exception:
-        return False
-
-# ===================== 세션 저장/ZIP (로컬 + Drive 업로드) =====================
+# ===================== 세션 저장/ZIP (로컬 전용) =====================
 def _save_df_csv(df: pd.DataFrame, path: str):
     if df is None or (hasattr(df, "empty") and df.empty): return
     df.to_csv(path, index=False, encoding="utf-8-sig")
@@ -776,7 +579,6 @@ def _slugify_filename(s: str) -> str:
     return s[:60]
 
 def _build_session_name() -> str:
-    # 이름 포맷: 검색어_yyyy-mm-dd-hh:mm_검색기간 (KST)
     kw = (st.session_state.get("s_query") or st.session_state.get("last_keyword") or "").strip() or "no_kw"
     preset = (st.session_state.get("s_preset") or "최근 1년").replace(" ", "")
     now_kst = datetime.now(_kst_tz()).strftime("%Y-%m-%d-%H:%M")
@@ -792,31 +594,11 @@ def _write_ai_texts(outdir: str):
         with open(os.path.join(outdir, "ai_advanced.md"), "w", encoding="utf-8") as f:
             f.write(adv_txt)
 
-def _write_viz_pngs(outdir: str):
-    df_comments_s = st.session_state.get("s_df_comments")
-    df_stats_s = st.session_state.get("s_df_stats")
-    df_comments_a = st.session_state.get("df_comments")
-    df_stats_a = st.session_state.get("df_stats")
-
-    dfc = df_comments_s if (df_comments_s is not None and not df_comments_s.empty) else st.session_state.get("df_comments")
-    dfs = df_stats_s if (df_stats_s is not None and not df_stats_s.empty) else st.session_state.get("df_stats")
-
-    figs = {
-        "viz_keyword_bubble.png": _fig_keyword_bubble(dfc) if dfc is not None and not dfc.empty else None,
-        "viz_time_series.png": _fig_time_series(dfc) if dfc is not None and not dfc.empty else None,
-        "viz_top_videos.png": _fig_top_videos(dfs) if dfs is not None and not dfs.empty else None,
-        "viz_top_authors.png": _fig_top_authors(dfc) if dfc is not None and not dfc.empty else None,
-    }
-    for fname, fig in figs.items():
-        _save_fig_png(fig, os.path.join(outdir, fname))
-
 def save_current_session(name_prefix: str | None = None):
-    # 새 포맷으로 세션 이름 생성
     sess_name = _build_session_name()
     outdir = os.path.join(SESS_DIR, sess_name)
     os.makedirs(outdir, exist_ok=True)
 
-    # 메타/QA 저장
     qa_data = {
         "simple_history": st.session_state.get("s_history", []),
         "adv_history": st.session_state.get("adv_history", []),
@@ -836,88 +618,10 @@ def save_current_session(name_prefix: str | None = None):
     _save_df_csv(st.session_state.get("df_analysis"), os.path.join(outdir, "adv_comments_sample.csv"))
     _save_df_csv(st.session_state.get("df_stats"), os.path.join(outdir, "adv_videos.csv"))
 
-    # AI 텍스트 + 시각화 PNG 저장
+    # AI 텍스트 저장
     _write_ai_texts(outdir)
-    _write_viz_pngs(outdir)
 
-    # 드라이브 진단 초기화
-    st.session_state["last_drive_debug"] = _drive_config_diagnostics()
-    st.session_state["last_drive_error"] = ""
-
-    # =============== Drive 업로드 (세션 폴더 생성 후 전체 업로드) ===============
-    drive_folder_id = None
-    uploaded = []
-    if GDRIVE_PARENT_FOLDER_ID and GDRIVE_KEYS:
-        try:
-            rd = RotatingDrive(GDRIVE_KEYS, log=lambda m: st.write(m))
-
-            # ★ 부모 폴더 메타 조회
-            parent_meta = drive_get_file_meta(rd, GDRIVE_PARENT_FOLDER_ID)
-
-            # ★ 세션 폴더 생성
-            drive_folder_id = drive_create_folder(rd, sess_name, GDRIVE_PARENT_FOLDER_ID)
-
-            # 업로드
-            mimemap = {
-                ".csv": "text/csv",
-                ".json": "application/json",
-                ".md": "text/markdown",
-                ".png": "image/png",
-                ".zip": "application/zip"
-            }
-            for fn in sorted(os.listdir(outdir)):
-                p = os.path.join(outdir, fn)
-                if not os.path.isfile(p):
-                    continue
-                ext = os.path.splitext(fn)[1].lower()
-                mime = mimemap.get(ext, "application/octet-stream")
-                info = drive_upload_file(rd, drive_folder_id, p, mime)
-                uploaded.append(info)
-
-            # manifest.json 업로드
-            manifest = {
-                "session_name": sess_name,
-                "parent_folder_id": GDRIVE_PARENT_FOLDER_ID,
-                "parent_drive_id": parent_meta.get("driveId", None),
-                "drive_folder_id": drive_folder_id,
-                "uploaded": uploaded,
-                "created_kst": datetime.now(_kst_tz()).strftime("%Y-%m-%d %H:%M:%S")
-            }
-            man_local = os.path.join(outdir, "manifest.json")
-            with open(man_local, "w", encoding="utf-8") as f:
-                json.dump(manifest, f, ensure_ascii=False, indent=2)
-            drive_upload_file(rd, drive_folder_id, man_local, "application/json")
-
-        except HttpError as e:
-            st.error("❗Drive 저장 실패 (HttpError)")
-            try:
-                st.write("• 부모 폴더 메타:", parent_meta)
-            except:
-                st.write("• 부모 폴더 메타 조회 실패")
-            st.write("• status:", getattr(getattr(e, "resp", None), "status", "n/a"))
-            st.write("• 메시지:", str(e))
-            st.warning(
-                "💡 점검 체크리스트\n"
-                "1) 부모 폴더가 **공유 드라이브** 소속인지\n"
-                "2) 서비스계정들이 공유 드라이브에 **콘텐츠 관리자** 이상 권한으로 초대됐는지\n"
-                "3) drive_* 함수가 **supportsAllDrives=True** 옵션으로 호출되는지\n"
-            )
-        except Exception as e:
-            st.error("❗Drive 저장 실패 (기타 예외)")
-            st.write("• 예외 타입:", type(e).__name__)
-            st.write("• 예외 메시지:", str(e))
-
-    else:
-        # 설정 자체가 비어있을 때 이유 저장
-        reasons = []
-        if not GDRIVE_PARENT_FOLDER_ID:
-            reasons.append("GDRIVE_PARENT_FOLDER_ID가 비어 있음")
-        if not GDRIVE_KEYS:
-            reasons.append("GDRIVE_KEY_1~3 파싱 실패")
-        st.session_state["last_drive_error"] = " / ".join(reasons)
-
-    return sess_name, drive_folder_id
-
+    return sess_name
 
 def list_sessions_local():
     if not os.path.exists(SESS_DIR): return []
@@ -941,7 +645,6 @@ def render_keyword_bubble(s_df_comments):
         }
         stopset = set(korean_stopwords); stopset.update(custom_stopwords)
 
-        # 🔑 검색어 불용어 추가
         query_kw = (st.session_state.get("s_query") 
                     or st.session_state.get("last_keyword") 
                     or st.session_state.get("adv_analysis_keyword") 
@@ -1108,7 +811,7 @@ def handle_followup_simple():
         st.error("Gemini API Key가 없습니다."); return
     if not st.session_state.get("s_serialized_sample"):
         st.error("분석 샘플이 없습니다. 먼저 수집/분석 실행."); return
-    append_log("심플-추가", st.session_state.get("s_query",""), follow_q)  # no-op
+    append_log("심플-추가", st.session_state.get("s_query",""), follow_q)
     context_str = build_history_context(st.session_state.get("s_history", []))
     system_instruction = (
         "너는 유튜브 댓글을 분석하는 어시스턴트다. "
@@ -1134,7 +837,7 @@ def handle_followup_advanced():
     df_analysis = st.session_state.get("df_analysis")
     if df_analysis is None or df_analysis.empty:
         st.error("분석 샘플이 없습니다. 먼저 수집/분석 실행."); return
-    append_log("고급-추가", st.session_state.get("last_keyword",""), adv_follow_q)  # no-op
+    append_log("고급-추가", st.session_state.get("last_keyword",""), adv_follow_q)
     a_text = st.session_state.get("adv_serialized_sample", "") or serialize_comments_for_llm(df_analysis)[0]
     context_str = build_history_context(st.session_state.get("adv_history", []))
     system_instruction = (
@@ -1196,14 +899,13 @@ with tab_simple:
         elif not st.session_state["simple_query"].strip():
             st.warning("드라마 or 배우명을 입력하세요.")
         else:
-            # === 동시 실행 락 시도 ===
             if not lock_guard_start_or_warn():
                 st.stop()
             try:
                 st.session_state["s_query"] = st.session_state["simple_query"].strip()
                 st.session_state["s_preset"] = preset_simple
                 st.session_state["s_history"] = []
-                append_log("심플", st.session_state["s_query"], st.session_state.get("simple_question", ""))  # no-op
+                append_log("심플", st.session_state["s_query"], st.session_state.get("simple_question", ""))
 
                 status_ph = st.empty()
                 with status_ph.status("심플 모드 실행 중…", expanded=True) as status:
@@ -1217,7 +919,6 @@ with tab_simple:
                     df_stats = pd.DataFrame(stats)
                     st.session_state["s_df_stats"] = df_stats
 
-                    # 병렬 댓글 수집 (대댓글 제외)
                     status.write("💬 댓글 수집 중…")
                     video_list = df_stats.to_dict('records')
                     prog = st.progress(0, text="수집 진행 중")
@@ -1249,7 +950,6 @@ with tab_simple:
                         )
                         st.session_state["s_serialized_sample"] = s_text
 
-                        # Gemini 분석
                         status.write("🧠 AI 분석 중…")
                         system_instruction = (
                             "너는 유튜브 댓글을 분석하는 어시스턴트다. "
@@ -1301,17 +1001,8 @@ with tab_simple:
     render_downloads(s_df_comments, s_df_analysis, s_df_stats, prefix="simple")
 
     if st.button("💾 세션 저장하기", key="simple_save_session"):
-        name, drive_id = save_current_session(None)
-        if drive_id:
-            st.success(f"세션 저장 완료 · Drive 폴더: https://drive.google.com/drive/folders/{drive_id}")
-        else:
-            st.success(f"세션 저장 완료(로컬) · {name}")
-            with st.expander("❗Drive 저장이 안 된 이유(임시 진단 로그)", expanded=True):
-                for line in st.session_state.get("last_drive_debug", []):
-                    st.write("• " + line)
-                err = st.session_state.get("last_drive_error", "")
-                if err:
-                    st.error("에러: " + err)
+        name = save_current_session(None)
+        st.success(f"세션 저장 완료(로컬) · {name}")
 
 # ===================== 2) 고급 모드 =====================
 with tab_advanced:
@@ -1532,7 +1223,7 @@ with tab_advanced:
                     if not lock_guard_start_or_warn():
                         st.stop()
                     try:
-                        append_log("고급", analysis_keyword, user_question_adv)  # no-op
+                        append_log("고급", analysis_keyword, user_question_adv)
                         st.session_state["adv_history"] = []
                         st.session_state["adv_followups"] = []
                         a_text = st.session_state.get("adv_serialized_sample", "") or serialize_comments_for_llm(df_analysis)[0]
@@ -1565,112 +1256,50 @@ with tab_advanced:
                 st.button("질문 보내기(고급)", key="adv_follow_btn", on_click=handle_followup_advanced)
 
                 if st.button("💾 세션 저장하기", key="adv_save_session_analysis"):
-                    name, drive_id = save_current_session(None)
-                    if drive_id:
-                        st.success(f"세션 저장 완료 · Drive 폴더: https://drive.google.com/drive/folders/{drive_id}")
-                    else:
-                        st.success(f"세션 저장 완료(로컬) · {name}")
-                        with st.expander("❗Drive 저장이 안 된 이유(임시 진단 로그)", expanded=True):
-                            for line in st.session_state.get("last_drive_debug", []):
-                                st.write("• " + line)
-                            err = st.session_state.get("last_drive_error", "")
-                            if err:
-                                st.error("에러: " + err)
+                    name = save_current_session(None)
+                    st.success(f"세션 저장 완료(로컬) · {name}")
 
     render_quant_viz(st.session_state.get("df_comments"), st.session_state.get("df_stats"), scope_label="(KST 기준)")
     render_downloads(st.session_state.get("df_comments"), st.session_state.get("df_analysis"),
                      st.session_state.get("df_stats"), prefix=f"adv_{len(st.session_state.get('selected_ids', []))}vids")
 
     if st.button("💾 세션 저장하기", key="adv_save_session_comments"):
-        name, drive_id = save_current_session(None)
-        if drive_id:
-            st.success(f"세션 저장 완료 · Drive 폴더: https://drive.google.com/drive/folders/{drive_id}")
-        else:
-            st.success(f"세션 저장 완료(로컬) · {name}")
-            with st.expander("❗Drive 저장이 안 된 이유(임시 진단 로그)", expanded=True):
-                for line in st.session_state.get("last_drive_debug", []):
-                    st.write("• " + line)
-                err = st.session_state.get("last_drive_error", "")
-                if err:
-                    st.error("에러: " + err)
+        name = save_current_session(None)
+        st.success(f"세션 저장 완료(로컬) · {name}")
 
 # ===================== 3) 세션 아카이브 =====================
 with tab_sessions:
     st.subheader("저장된 세션 아카이브")
-
-    drive_ok = bool(GDRIVE_PARENT_FOLDER_ID and GDRIVE_KEYS)
-    if not drive_ok:
-        st.info("Drive 설정이 없어 로컬 세션만 표시됩니다.")
-        with st.expander("❗Drive 사용 불가 사유(임시 진단 로그)", expanded=False):
-            for line in _drive_config_diagnostics():
-                st.write("• " + line)
-        sess_list = list_sessions_local()
-        if not sess_list:
-            st.info("저장된 세션이 없습니다.")
-        else:
-            selected = st.selectbox("세션 선택(로컬)", sess_list, key="sess_select_local")
-            sess_path = os.path.join(SESS_DIR, selected)
-            qa_file = os.path.join(sess_path, "qa.json")
-            if os.path.exists(qa_file):
-                with open(qa_file, encoding="utf-8") as f:
-                    qa_data = json.load(f)
-                st.write("### 질문/응답")
-                for i,(q,a) in enumerate(qa_data.get("simple_history",[]),1):
-                    with st.expander(f"[심플 Q{i}] {q}", expanded=False):
-                        st.markdown(a)
-                for i,(q,a) in enumerate(qa_data.get("adv_history",[]),1):
-                    with st.expander(f"[고급 Q{i}] {q}", expanded=False):
-                        st.markdown(a)
-            if st.button("📦 ZIP 만들기/새로고침", key="sess_zip_build_local"):
-                zip_session(selected); st.success("ZIP 생성/갱신 완료")
-            zip_path = os.path.join(SESS_DIR, f"{selected}.zip")
-            if os.path.exists(zip_path):
-                with open(zip_path, "rb") as f:
-                    st.download_button("⬇️ 세션 전체 다운로드 (ZIP)", data=f.read(), file_name=f"{selected}.zip")
-            st.write("### 세션 폴더 파일 (CSV/JSON/PNG)")
-            for fn in sorted(os.listdir(sess_path)):
-                p = os.path.join(sess_path, fn)
-                if os.path.isfile(p):
-                    with open(p, "rb") as f:
-                        st.download_button(f"⬇️ {fn}", data=f.read(), file_name=fn, key=f"dl_{selected}_{fn}")
+    sess_list = list_sessions_local()
+    if not sess_list:
+        st.info("저장된 세션이 없습니다.")
     else:
-        # Drive 세션 전체 목록 표시
-        try:
-            rd = RotatingDrive(GDRIVE_KEYS, log=lambda m: st.write(m))
-            folders = drive_list_folders(rd, GDRIVE_PARENT_FOLDER_ID)
-            if not folders:
-                st.info("Drive에 저장된 세션이 없습니다.")
-            else:
-                options = [f["name"] for f in folders]
-                idx_map = {f["name"]: f["id"] for f in folders}
-                selected_name = st.selectbox("세션 선택(Drive)", options, key="sess_select_drive")
-                selected_id = idx_map.get(selected_name)
-                if selected_id:
-                    files = drive_list_files_in_folder(rd, selected_id)
-                    manifest = next((x for x in files if x["name"] == "manifest.json"), None)
-                    if manifest:
-                        st.markdown(f"- **Drive 폴더 링크:** https://drive.google.com/drive/folders/{selected_id}")
-                    st.write("### 파일 목록 (Drive)")
-                    for fobj in files:
-                        name = fobj.get("name")
-                        size = fobj.get("size", "0")
-                        vlink = fobj.get("webViewLink")
-                        dlink = fobj.get("webContentLink")
-                        mt = fobj.get("mimeType","")
-                        created = fobj.get("createdTime","")
-                        col1, col2 = st.columns([6,4])
-                        with col1:
-                            st.markdown(f"**{name}**  \n타입: `{mt}` · 생성: `{created}` · 크기: {size}")
-                        with col2:
-                            if vlink:
-                                st.link_button("열기", vlink, help="브라우저에서 보기", key=f"view_{selected_id}_{name}")
-                            if dlink:
-                                st.link_button("다운로드", dlink, help="바로 다운로드", key=f"dl_{selected_id}_{name}")
-                    st.caption("※ Drive 링크는 접근 권한이 있는 사용자만 열 수 있습니다.")
-        except Exception as e:
-            st.warning(f"Drive 아카이브 로드 실패: {e}")
-            with st.expander("진단(스택 하이라이트)", expanded=False):
-                st.code(f"{type(e).__name__}: {e}\n" + "\n".join(traceback.format_exc().splitlines()[-8:]), language="text")
+        selected = st.selectbox("세션 선택", sess_list, key="sess_select_local")
+        sess_path = os.path.join(SESS_DIR, selected)
+        qa_file = os.path.join(sess_path, "qa.json")
+        if os.path.exists(qa_file):
+            with open(qa_file, encoding="utf-8") as f:
+                qa_data = json.load(f)
+            st.write("### 질문/응답")
+            for i,(q,a) in enumerate(qa_data.get("simple_history",[]),1):
+                with st.expander(f"[심플 Q{i}] {q}", expanded=False):
+                    st.markdown(a)
+            for i,(q,a) in enumerate(qa_data.get("adv_history",[]),1):
+                with st.expander(f"[고급 Q{i}] {q}", expanded=False):
+                    st.markdown(a)
+
+        if st.button("📦 ZIP 만들기/새로고침", key="sess_zip_build_local"):
+            zip_session(selected); st.success("ZIP 생성/갱신 완료")
+        zip_path = os.path.join(SESS_DIR, f"{selected}.zip")
+        if os.path.exists(zip_path):
+            with open(zip_path, "rb") as f:
+                st.download_button("⬇️ 세션 전체 다운로드 (ZIP)", data=f.read(), file_name=f"{selected}.zip")
+        st.write("### 세션 폴더 파일 (CSV/JSON)")
+        for fn in sorted(os.listdir(sess_path)):
+            p = os.path.join(sess_path, fn)
+            if os.path.isfile(p):
+                with open(p, "rb") as f:
+                    st.download_button(f"⬇️ {fn}", data=f.read(), file_name=fn, key=f"dl_{selected}_{fn}")
 
 # ===================== 초기화 버튼 =====================
 st.markdown("---")
