@@ -230,16 +230,39 @@ def call_gemini_rotating(model_name: str, keys, system_instruction: str, user_pa
 
 # ===================== GitHub 저장/불러오기 =====================
 def github_upload_file(repo, branch, path_in_repo, local_path, token):
+    """GitHub 저장소에 파일 업로드 (덮어쓰기 지원)"""
     with open(local_path, "rb") as f:
         content = f.read()
     b64 = base64.b64encode(content).decode()
     url = f"https://api.github.com/repos/{repo}/contents/{path_in_repo}"
     headers = {"Authorization": f"token {token}"}
-    data = {"message": f"Add {path_in_repo}", "content": b64, "branch": branch}
+
+    # 🔍 기존 파일 여부 확인
+    sha = None
+    resp_get = requests.get(url+f"?ref={branch}", headers=headers)
+    if resp_get.status_code == 200:
+        sha = resp_get.json().get("sha")
+
+    # 📦 업로드 데이터
+    data = {
+        "message": f"Update {path_in_repo}",
+        "content": b64,
+        "branch": branch
+    }
+    if sha:
+        data["sha"] = sha   # 이미 존재하면 덮어쓰기
+
+    # 🚀 업로드 실행
     resp = requests.put(url, headers=headers, json=data)
     if resp.status_code not in (200,201):
-        raise RuntimeError(f"GitHub 업로드 실패: {resp.text}")
+        st.error(f"GitHub 업로드 실패: {resp.status_code}")
+        try:
+            st.code(resp.text, language="json")
+        except Exception:
+            st.write(resp.text)
+        raise RuntimeError("GitHub 업로드 실패")
     return resp.json()
+
 
 def github_download_file(repo, branch, path_in_repo, token):
     url = f"https://api.github.com/repos/{repo}/contents/{path_in_repo}?ref={branch}"
