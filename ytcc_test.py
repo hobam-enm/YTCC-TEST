@@ -137,6 +137,17 @@ def lock_guard_start_or_warn():
         return False
     return True
 
+def drive_get_file_meta(rd, file_id: str) -> dict:
+    def _get(svc):
+        return svc.files().get(
+            fileId=file_id,
+            fields="id, name, parents, driveId, mimeType",
+            supportsAllDrives=True,           # ★ 공유드라이브도 조회 가능
+            includeItemsFromAllDrives=True,   # ★
+        ).execute()
+    return rd.execute(_get)
+
+
 # ===================== 기본 UI =====================
 st.set_page_config(page_title="📊 유튜브 반응 리포트: AI 댓글요약", layout="wide", initial_sidebar_state="collapsed")
 st.title("📊 유튜브 반응 분석: AI 댓글요약")
@@ -317,26 +328,49 @@ class RotatingDrive:
                     continue
                 raise
 
-def drive_create_folder(rd: RotatingDrive, name: str, parent_id: str) -> str:
+def drive_create_folder(rd: "RotatingDrive", name: str, parent_id: str) -> str:
     def _create(svc):
-        meta = {"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id]}
-        return svc.files().create(body=meta, fields="id").execute()["id"]
+        meta = {
+            "name": name,
+            "mimeType": "application/vnd.google-apps.folder",
+            "parents": [parent_id],
+        }
+        return svc.files().create(
+            body=meta,
+            fields="id",
+            supportsAllDrives=True,            # ★ 중요
+        ).execute()["id"]
     return rd.execute(_create)
 
-def drive_upload_file(rd: RotatingDrive, folder_id: str, local_path: str, mime_type: str | None = None) -> dict:
+
+def drive_upload_file(rd: "RotatingDrive", folder_id: str, local_path: str, mime_type: str | None = None) -> dict:
     filename = os.path.basename(local_path)
     def _upload(svc):
         meta = {"name": filename, "parents": [folder_id]}
         media = MediaFileUpload(local_path, mimetype=mime_type, resumable=False)
-        return svc.files().create(body=meta, media_body=media, fields="id, name, mimeType, webViewLink, webContentLink, size, createdTime").execute()
+        return svc.files().create(
+            body=meta,
+            media_body=media,
+            fields="id, name, mimeType, webViewLink, webContentLink, size, createdTime",
+            supportsAllDrives=True,            # ★ 중요
+        ).execute()
     return rd.execute(_upload)
 
-def drive_list_folders(rd: RotatingDrive, parent_id: str) -> list[dict]:
-    items = []
-    page_token = None
+
+def drive_list_folders(rd: "RotatingDrive", parent_id: str) -> list[dict]:
+    items, page_token = [], None
     query = f"'{parent_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+
     def _list(svc, token):
-        return svc.files().list(q=query, spaces="drive", fields="nextPageToken, files(id, name, createdTime)", pageToken=token, orderBy="name").execute()
+        return svc.files().list(
+            q=query,
+            fields="nextPageToken, files(id, name, createdTime)",
+            pageToken=token,
+            orderBy="name",
+            supportsAllDrives=True,            # ★
+            includeItemsFromAllDrives=True,    # ★
+        ).execute()
+
     while True:
         resp = rd.execute(lambda svc: _list(svc, page_token))
         items.extend(resp.get("files", []))
@@ -345,11 +379,21 @@ def drive_list_folders(rd: RotatingDrive, parent_id: str) -> list[dict]:
             break
     return items
 
-def drive_list_files_in_folder(rd: RotatingDrive, folder_id: str) -> list[dict]:
+
+def drive_list_files_in_folder(rd: "RotatingDrive", folder_id: str) -> list[dict]:
     items, page_token = [], None
     query = f"'{folder_id}' in parents and trashed=false"
+
     def _list(svc, token):
-        return svc.files().list(q=query, spaces="drive", fields="nextPageToken, files(id, name, mimeType, size, webViewLink, webContentLink, createdTime)", pageToken=token, orderBy="name").execute()
+        return svc.files().list(
+            q=query,
+            fields="nextPageToken, files(id, name, mimeType, size, webViewLink, webContentLink, createdTime)",
+            pageToken=token,
+            orderBy="name",
+            supportsAllDrives=True,             # ★
+            includeItemsFromAllDrives=True,     # ★
+        ).execute()
+
     while True:
         resp = rd.execute(lambda svc: _list(svc, page_token))
         items.extend(resp.get("files", []))
@@ -357,6 +401,7 @@ def drive_list_files_in_folder(rd: RotatingDrive, folder_id: str) -> list[dict]:
         if not page_token:
             break
     return items
+
 
 # ===================== 유틸: ID/URL =====================
 def extract_video_id_one(s: str):
@@ -799,53 +844,85 @@ def save_current_session(name_prefix: str | None = None):
     st.session_state["last_drive_debug"] = _drive_config_diagnostics()
     st.session_state["last_drive_error"] = ""
 
-    # Drive 업로드 (세션 폴더 생성 후 전체 업로드)
-    drive_folder_id = None
-    uploaded = []
-    if GDRIVE_PARENT_FOLDER_ID and GDRIVE_KEYS:
+# Drive 업로드 (세션 폴더 생성 후 전체 업로드)
+drive_folder_id = None
+uploaded = []
+if GDRIVE_PARENT_FOLDER_ID and GDRIVE_KEYS:
+    try:
+        rd = RotatingDrive(GDRIVE_KEYS, log=lambda m: st.write(m))
+
+        # ★ 부모 폴더 메타 조회: 공유드라이브 컨텍스트/driveId 확인용
+        parent_meta = drive_get_file_meta(rd, GDRIVE_PARENT_FOLDER_ID)
+
+        # ★ 세션 폴더 생성 (supportsAllDrives 적용된 drive_create_folder 사용 전제)
+        drive_folder_id = drive_create_folder(rd, sess_name, GDRIVE_PARENT_FOLDER_ID)
+
+        # 업로드
+        mimemap = {
+            ".csv": "text/csv",
+            ".json": "application/json",
+            ".md": "text/markdown",
+            ".png": "image/png",
+            ".zip": "application/zip"
+        }
+        for fn in sorted(os.listdir(outdir)):
+            p = os.path.join(outdir, fn)
+            if not os.path.isfile(p):
+                continue
+            ext = os.path.splitext(fn)[1].lower()
+            mime = mimemap.get(ext, "application/octet-stream")
+            info = drive_upload_file(rd, drive_folder_id, p, mime)  # supportsAllDrives 적용된 버전이어야 함
+            uploaded.append(info)
+
+        # manifest.json 업로드 (추가: parent_drive_id 기록)
+        manifest = {
+            "session_name": sess_name,
+            "parent_folder_id": GDRIVE_PARENT_FOLDER_ID,
+            "parent_drive_id": parent_meta.get("driveId", None),  # 공유드라이브면 값이 들어옴
+            "drive_folder_id": drive_folder_id,
+            "uploaded": uploaded,
+            "created_kst": datetime.now(_kst_tz()).strftime("%Y-%m-%d %H:%M:%S")
+        }
+        man_local = os.path.join(outdir, "manifest.json")
+        with open(man_local, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2)
+        drive_upload_file(rd, drive_folder_id, man_local, "application/json")
+
+    except HttpError as e:
+        # ❗ 임시 진단 로그(왜 드라이브 저장이 안 됐는지 화면에 바로 표시)
+        st.error("❗Drive 저장 실패 (HttpError)")
         try:
-            st.info("🔧 Drive 업로드 시작: 세션 폴더 생성 시도 중…")
-            rd = RotatingDrive(GDRIVE_KEYS, log=lambda m: st.write(m))
-            drive_folder_id = drive_create_folder(rd, sess_name, GDRIVE_PARENT_FOLDER_ID)
-            st.success(f"📁 Drive 세션 폴더 생성 완료: {drive_folder_id}")
+            st.write("• 부모 폴더 메타:", parent_meta)
+        except:
+            st.write("• 부모 폴더 메타 조회 실패")
+        st.write("• reason:", getattr(e, "error_details", None) or "n/a")
+        st.write("• status:", getattr(getattr(e, "resp", None), "status", "n/a"))
+        try:
+            payload = json.loads(getattr(e, "content", b"{}").decode("utf-8", errors="ignore"))
+        except Exception:
+            payload = {}
+        st.write("• raw:", payload)
+        st.warning(
+            "💡 점검 체크리스트\n"
+            "1) 부모 폴더가 **공유 드라이브(Shared Drive)** 소속인지\n"
+            "2) 서비스계정들이 공유 드라이브에 **콘텐츠 관리자** 이상 권한으로 초대됐는지\n"
+            "3) 코드의 drive_* 함수가 **supportsAllDrives=True** / **includeItemsFromAllDrives=True**로 호출되는지\n"
+        )
+    except Exception as e:
+        st.error("❗Drive 저장 실패 (기타 예외)")
+        try:
+            st.write("• 부모 폴더 메타:", parent_meta)
+        except:
+            st.write("• 부모 폴더 메타 조회 실패")
+        st.write("• 예외 타입:", type(e).__name__)
+        st.write("• 예외 메시지:", str(e))
+        st.warning(
+            "💡 점검 체크리스트\n"
+            "1) 부모 폴더가 **공유 드라이브(Shared Drive)** 소속인지\n"
+            "2) 서비스계정들이 공유 드라이브에 **콘텐츠 관리자** 이상 권한으로 초대됐는지\n"
+            "3) 코드의 drive_* 함수가 **supportsAllDrives=True** / **includeItemsFromAllDrives=True**로 호출되는지\n"
+        )
 
-            # 업로드
-            mimemap = {
-                ".csv": "text/csv",
-                ".json": "application/json",
-                ".md": "text/markdown",
-                ".png": "image/png",
-                ".zip": "application/zip"
-            }
-            for fn in sorted(os.listdir(outdir)):
-                p = os.path.join(outdir, fn)
-                if not os.path.isfile(p):
-                    continue
-                ext = os.path.splitext(fn)[1].lower()
-                mime = mimemap.get(ext, "application/octet-stream")
-                info = drive_upload_file(rd, drive_folder_id, p, mime)
-                st.write(f"⬆️ 업로드 완료: {fn} → {info.get('id')}")
-                uploaded.append(info)
-
-            # manifest.json 업로드
-            manifest = {
-                "session_name": sess_name,
-                "parent_folder_id": GDRIVE_PARENT_FOLDER_ID,
-                "drive_folder_id": drive_folder_id,
-                "uploaded": uploaded,
-                "created_kst": datetime.now(_kst_tz()).strftime("%Y-%m-%d %H:%M:%S")
-            }
-            man_local = os.path.join(outdir, "manifest.json")
-            with open(man_local, "w", encoding="utf-8") as f:
-                json.dump(manifest, f, ensure_ascii=False, indent=2)
-            drive_upload_file(rd, drive_folder_id, man_local, "application/json")
-            st.success("🗂️ manifest.json 업로드 완료")
-        except Exception as e:
-            err_msg = f"{type(e).__name__}: {e}"
-            st.session_state["last_drive_error"] = err_msg
-            # 안전한 범위 내에서 간단 스택
-            st.warning("Drive 업로드 중 문제 발생 (자세한 진단 아래 표시)")
-            st.code(err_msg + "\n" + "\n".join(traceback.format_exc().splitlines()[-5:]), language="text")
     else:
         # 설정 자체가 비어있을 때도 사유를 남김
         reasons = []
