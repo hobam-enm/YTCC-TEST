@@ -560,12 +560,14 @@ ensure_state()
 
 # ===================== 히스토리 → 컨텍스트 =====================
 def build_history_context(pairs: list[tuple[str, str]]) -> str:
-    if not pairs: return ""
+    if not pairs:
+        return ""
     lines = []
     for i, (q, a) in enumerate(pairs, 1):
-        lines.append(f"[이전 Q{i}]: {q]")
-        lines.append(f"[이전 A{i}]: {a}")
+        lines.append(f"[이전 Q{i}]: {q}")   # ← 여기 닫는 괄호를 } 로
+        lines.append(f"[이전 A{i}]: {a}")   # ← 이 줄도 동일 패턴
     return "\n".join(lines)
+
 
 # ===================== 시각화 도구(저장용) =====================
 def _fig_keyword_bubble(df_comments) -> go.Figure | None:
